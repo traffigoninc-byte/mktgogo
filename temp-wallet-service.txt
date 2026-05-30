@@ -1,0 +1,332 @@
+/**
+ * Wallet Service
+ * 
+ * Manages vendor wallet balances and transaction history.
+ * Uses SERIALIZABLE transaction isolation for all operations.
+ * 
+ * Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 5.3
+ */
+
+import { Pool, PoolClient } from 'pg';
+import { WalletRepository } from '../repositories/wallet.repository';
+import {
+  Wallet,
+  WalletTransaction,
+  CreditWalletRequest,
+  DebitWalletRequest,
+  GetTransactionsRequest
+} from '../types/payment.types';
+
+export class WalletService {
+  private pool: Pool;
+  private walletRepository: WalletRepository;
+
+  constructor(pool: Pool) {
+    this.pool = pool;
+    this.walletRepository = new WalletRepository(pool);
+  }
+
+  /**
+   * Get or create wallet for vendor
+   * Requirement 4.1: Create wallet with initial balance of zero
+   */
+  async getWallet(vendorId: string, currency: string): Promise<Wallet> {
+    let wallet = await this.walletRepository.findByVendorAndCurrency(vendorId, currency);
+    if (!wallet) {
+      wallet = await this.walletRepository.create(vendorId, currency);
+    }
+    return wallet;
+  }
+
+  /**
+   * Credit wallet
+   * Requirements: 4.2, 4.5, 4.8
+   */
+  async creditWallet(
+    params: CreditWalletRequest,
+    client?: PoolClient
+  ): Promise<WalletTransaction> {
+    const useExternalClient = !!client;
+    const executor = client || await this.pool.connect();
+
+    try {
+      if (!useExternalClient) {
+        await executor.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      }
+
+      // Check for idempotency
+      const existingTransaction = await this.walletRepository.findTransactionByIdempotencyKey(
+        params.idempotencyKey,
+        executor
+      );
+
+      if (existingTransaction) {
+        if (!useExternalClient) {
+          await executor.query('COMMIT');
+        }
+        return existingTransaction;
+      }
+
+      // Get or create wallet
+      let wallet = await this.walletRepository.findByVendorAndCurrency(
+        params.vendorId,
+        params.currency,
+        executor
+      );
+
+      if (!wallet) {
+        wallet = await this.walletRepository.create(params.vendorId, params.currency, executor);
+      }
+
+      // Update balance
+      const updatedWallet = await this.walletRepository.updateBalance(
+        wallet.id,
+        params.amount,
+        executor
+      );
+
+      // Create transaction record
+      const transaction = await this.walletRepository.createTransaction(
+        {
+          walletId: wallet.id,
+          type: 'credit',
+          category: params.type,
+          amount: params.amount,
+          balanceAfter: updatedWallet.balance,
+          reference: params.reference,
+          description: params.description,
+          idempotencyKey: params.idempotencyKey
+        },
+        executor
+      );
+
+      if (!useExternalClient) {
+        await executor.query('COMMIT');
+      }
+
+      return transaction;
+    } catch (error) {
+      if (!useExternalClient) {
+        await executor.query('ROLLBACK');
+      }
+      throw error;
+    } finally {
+      if (!useExternalClient) {
+        (executor as PoolClient).release();
+      }
+    }
+  }
+
+  /**
+   * Debit wallet
+   * Requirements: 4.3, 4.5, 4.6, 4.8
+   */
+  async debitWallet(
+    params: DebitWalletRequest,
+    client?: PoolClient
+  ): Promise<WalletTransaction> {
+    const useExternalClient = !!client;
+    const executor = client || await this.pool.connect();
+
+    try {
+      if (!useExternalClient) {
+        await executor.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      }
+
+      // Check for idempotency
+      const existingTransaction = await this.walletRepository.findTransactionByIdempotencyKey(
+        params.idempotencyKey,
+        executor
+      );
+
+      if (existingTransaction) {
+        if (!useExternalClient) {
+          await executor.query('COMMIT');
+        }
+        return existingTransaction;
+      }
+
+      // Get wallet
+      const wallet = await this.walletRepository.findByVendorAndCurrency(
+        params.vendorId,
+        params.currency,
+        executor
+      );
+
+      if (!wallet) {
+        throw new Error(`Wallet not found for vendor ${params.vendorId} and currency ${params.currency}`);
+      }
+
+      // Check balance (Requirement 4.6: prevent negative balance unless explicitly allowed)
+      if (!params.allowNegative && wallet.balance < params.amount) {
+        throw new Error(
+          `Insufficient balance. Available: ${wallet.balance}, Required: ${params.amount}`
+        );
+      }
+
+      // Update balance
+      const updatedWallet = await this.walletRepository.updateBalance(
+        wallet.id,
+        -params.amount,
+        executor
+      );
+
+      // Create transaction record
+      const transaction = await this.walletRepository.createTransaction(
+        {
+          walletId: wallet.id,
+          type: 'debit',
+          category: params.type,
+          amount: params.amount,
+          balanceAfter: updatedWallet.balance,
+          reference: params.reference,
+          description: params.description,
+          idempotencyKey: params.idempotencyKey
+        },
+        executor
+      );
+
+      if (!useExternalClient) {
+        await executor.query('COMMIT');
+      }
+
+      return transaction;
+    } catch (error) {
+      if (!useExternalClient) {
+        await executor.query('ROLLBACK');
+      }
+      throw error;
+    } finally {
+      if (!useExternalClient) {
+        (executor as PoolClient).release();
+      }
+    }
+  }
+
+  /**
+   * Get wallet balance
+   * Requirement 4.1
+   */
+  async getBalance(vendorId: string, currency: string): Promise<number> {
+    const wallet = await this.getWallet(vendorId, currency);
+    return wallet.balance;
+  }
+
+  /**
+   * Get wallet transactions with filtering
+   * Requirement 4.7
+   */
+  async getTransactions(params: GetTransactionsRequest): Promise<WalletTransaction[]> {
+    const wallet = await this.getWallet(params.vendorId, params.currency);
+    
+    return this.walletRepository.findTransactionsByWalletId(wallet.id, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+      type: params.type,
+      category: params.category,
+      limit: params.limit,
+      offset: params.offset
+    });
+  }
+
+  /**
+   * Reserve amount for pending payout
+   * Requirement 5.3
+   */
+  async reserveAmount(
+    vendorId: string,
+    currency: string,
+    amount: number,
+    reference: string,
+    client?: PoolClient
+  ): Promise<void> {
+    const useExternalClient = !!client;
+    const executor = client || await this.pool.connect();
+
+    try {
+      if (!useExternalClient) {
+        await executor.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      }
+
+      const wallet = await this.walletRepository.findByVendorAndCurrency(
+        vendorId,
+        currency,
+        executor
+      );
+
+      if (!wallet) {
+        throw new Error(`Wallet not found for vendor ${vendorId} and currency ${currency}`);
+      }
+
+      // Check if enough available balance
+      if (wallet.availableBalance < amount) {
+        throw new Error(
+          `Insufficient available balance. Available: ${wallet.availableBalance}, Required: ${amount}`
+        );
+      }
+
+      // Update reserved balance
+      await this.walletRepository.updateReservedBalance(wallet.id, amount, executor);
+
+      if (!useExternalClient) {
+        await executor.query('COMMIT');
+      }
+    } catch (error) {
+      if (!useExternalClient) {
+        await executor.query('ROLLBACK');
+      }
+      throw error;
+    } finally {
+      if (!useExternalClient) {
+        (executor as PoolClient).release();
+      }
+    }
+  }
+
+  /**
+   * Release reserved amount
+   * Requirement 5.8
+   */
+  async releaseReservedAmount(
+    vendorId: string,
+    currency: string,
+    amount: number,
+    reference: string,
+    client?: PoolClient
+  ): Promise<void> {
+    const useExternalClient = !!client;
+    const executor = client || await this.pool.connect();
+
+    try {
+      if (!useExternalClient) {
+        await executor.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      }
+
+      const wallet = await this.walletRepository.findByVendorAndCurrency(
+        vendorId,
+        currency,
+        executor
+      );
+
+      if (!wallet) {
+        throw new Error(`Wallet not found for vendor ${vendorId} and currency ${currency}`);
+      }
+
+      // Update reserved balance (decrease)
+      await this.walletRepository.updateReservedBalance(wallet.id, -amount, executor);
+
+      if (!useExternalClient) {
+        await executor.query('COMMIT');
+      }
+    } catch (error) {
+      if (!useExternalClient) {
+        await executor.query('ROLLBACK');
+      }
+      throw error;
+    } finally {
+      if (!useExternalClient) {
+        (executor as PoolClient).release();
+      }
+    }
+  }
+}
