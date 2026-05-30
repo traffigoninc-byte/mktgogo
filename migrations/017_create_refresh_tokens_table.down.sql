@@ -1,0 +1,10 @@
+-- Migration Rollback: Drop refresh_tokens table
+-- Description: Removes the refresh_tokens table and all associated indexes
+
+-- Drop indexes
+DROP INDEX IF EXISTS idx_refresh_tokens_expires_at;
+DROP INDEX IF EXISTS idx_refresh_tokens_token_hash;
+DROP INDEX IF EXISTS idx_refresh_tokens_user_id;
+
+-- Drop table
+DROP TABLE IF EXISTS refresh_tokens;
