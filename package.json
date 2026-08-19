@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
+    "dev:netlify": "netlify dev",
     "test": "vitest --run",
     "test:watch": "vitest"
   },
@@ -39,6 +40,8 @@
     "jsonwebtoken": "^9.0.3",
     "paystack": "^2.0.1",
     "pg": "^8.11.0",
-    "stripe": "^20.4.0"
+    "serverless-http": "^3.2.0",
+    "stripe": "^20.4.0",
+    "@netlify/functions": "^2.0.0"
   }
 }
