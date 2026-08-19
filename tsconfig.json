@@ -30,6 +30,6 @@
       "@/models/*": ["models/*"]
     }
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "netlify/**/*"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
